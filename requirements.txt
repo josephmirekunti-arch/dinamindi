@@ -1,0 +1,13 @@
+pandas
+numpy
+scikit-learn
+statsmodels
+understatapi
+pyyaml
+sqlalchemy
+aiohttp
+fastapi
+uvicorn
+python-dotenv
+pydantic
+certifi

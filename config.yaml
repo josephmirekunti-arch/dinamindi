@@ -1,0 +1,18 @@
+# Model Configuration
+competitions_in_scope:
+  - EPL
+  - La_Liga
+  - Bundesliga
+
+# Simulation Settings
+max_goals: 8
+
+# Feature Engineering
+rolling_windows: [5, 10, 20]
+time_decay_gamma: 0.02 # per day decay factor
+min_matches: 5 # threshold for model inclusion
+
+selection_thresholds:
+  binary_markets: 0.55
+  1x2_top_prob: 0.50
+  1x2_margin: 0.10
