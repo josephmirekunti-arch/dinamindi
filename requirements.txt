@@ -11,3 +11,5 @@ uvicorn
 python-dotenv
 pydantic
 certifi
+torch
+catboost

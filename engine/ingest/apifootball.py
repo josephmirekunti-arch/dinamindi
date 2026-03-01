@@ -63,21 +63,10 @@ class APIFootballIngestor:
             "season": season
         }
         
-        all_fixtures = []
         async with aiohttp.ClientSession() as session:
-            page = 1
-            while True:
-                params["page"] = page
-                data = await self._fetch(session, "fixtures", params)
-                responses = data.get('response', [])
-                all_fixtures.extend(responses)
-                
-                paging = data.get('paging')
-                if not paging or paging.get('current', 1) >= paging.get('total', 1):
-                    break
-                page += 1
-                
-            return all_fixtures
+            data = await self._fetch(session, "fixtures", params)
+            responses = data.get('response', [])
+            return responses
             
     async def get_fixture_statistics(self, fixture_id: int) -> List[dict]:
         """
@@ -97,6 +86,19 @@ class APIFootballIngestor:
             data = await self._fetch(session, "fixtures/lineups", params)
             return data.get('response', [])
             
+    async def get_team_player_stats(self, team_id: int, season: str) -> List[dict]:
+        """
+        Fetch player statistics for a specific team and season.
+        Useful for identifying "Top Outliers" (Goal scorers, assisters, etc.)
+        """
+        params = {
+            "team": team_id,
+            "season": season
+        }
+        async with aiohttp.ClientSession() as session:
+            data = await self._fetch(session, "players", params)
+            return data.get('response', [])
+
     async def get_fixture_odds(self, fixture_id: int, bookmaker_id: int = 8) -> List[dict]:
         """
         Fetch pre-match odds for a specific fixture. Defaults to Bet365 (8).

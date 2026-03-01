@@ -38,6 +38,10 @@ class Match(Base):
     home_lineup = Column(String, nullable=True) # Stored as JSON string
     away_lineup = Column(String, nullable=True) # Stored as JSON string
     goal_events = Column(String, nullable=True) # Stored as JSON string of minutes and teams
+    referee = Column(String, nullable=True)
+    odds_1x2_home = Column(Float, nullable=True)
+    odds_1x2_draw = Column(Float, nullable=True)
+    odds_1x2_away = Column(Float, nullable=True)
     
     is_played = Column(Boolean, default=True)
 

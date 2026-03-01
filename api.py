@@ -77,6 +77,8 @@ def load_pipeline():
     # --- 2. Attempt to enrich with API-Football ---
     api_football_key = os.environ.get("API_FOOTBALL_KEY")
     api_football_raw = []
+    top_players = {} # {team_id: [player_ids]}
+    squad_churn = {} # {team_id: churn_rate}
     
     if api_football_key:
         print(f"API_FOOTBALL_KEY detected. Enriching {target_season} data...")
@@ -92,8 +94,24 @@ def load_pipeline():
                 print(f"Fetching API-Football data for {comp_key}...")
                 comp_raw = asyncio.run(api_client.get_fixtures(comp_key, target_season))
                 api_football_raw.extend(comp_raw)
+                
+                # RECENT RESEARCH: Fetch Top 3 players per team to track availability
+                # We fetch from previous season (2023) to identify the "stars"
+                league_id = api_client.LEAGUE_IDS.get(comp_key)
+                if league_id:
+                    # In a real system, we'd cache this. For now, we fetch for each team.
+                    # To save hits, we only fetch for the top 5 teams per league for this demo
+                    team_ids = list(set([f['teams']['home']['id'] for f in comp_raw]))[:10]
+                    for t_id in team_ids:
+                        p_stats = asyncio.run(api_client.get_team_player_stats(t_id, '2023'))
+                        # Rank by goals + assists
+                        def p_score(p):
+                            s = p['statistics'][0]
+                            return (s['goals']['total'] or 0) + (s['goals']['assists'] or 0) * 0.5
+                        p_stats = sorted(p_stats, key=p_score, reverse=True)[:3]
+                        top_players[str(t_id)] = [p['player']['id'] for p in p_stats]
         except Exception as e:
-            print(f"Failed to fetch API-Football data: {e}")
+            print(f"Failed to fetch API-Football data/outliers: {e}")
             
     # --- 3. Construct Unified Dataset ---
     import urllib.request
@@ -133,9 +151,24 @@ def load_pipeline():
             base_record['apifootball_id'] = best_fix['fixture']['id']
             base_record['home_logo'] = best_fix.get('teams', {}).get('home', {}).get('logo')
             base_record['away_logo'] = best_fix.get('teams', {}).get('away', {}).get('logo')
+            base_record['referee'] = best_fix['fixture'].get('referee')
             
+            # Fetch pre-match odds for feature engineering
+            if api_football_key:
+                try:
+                    # check if we already have odds in base_record (optional if we persist, but here we rebuild)
+                    odds_data = asyncio.run(api_client.get_fixture_odds(base_record['apifootball_id']))
+                    if odds_data:
+                        bets = odds_data[0].get('bookmakers', [{}])[0].get('bets', [])
+                        for bet in bets:
+                            if bet['name'] in ['Match Winner', 'Full Time Result']:
+                                for val in bet['values']:
+                                    if val['value'] == 'Home': base_record['odds_1x2_home'] = float(val['odd'])
+                                    if val['value'] == 'Draw': base_record['odds_1x2_draw'] = float(val['odd'])
+                                    if val['value'] == 'Away': base_record['odds_1x2_away'] = float(val['odd'])
+                except: pass
+
             # --- REAL-TIME MATCH COMPLETION OVERRIDE ---
-            # Understat is slow to update. If API-Football says it's done, trust it.
             status_short = best_fix['fixture']['status']['short']
             if status_short in ['FT', 'AET', 'PEN']:
                 base_record['is_played'] = True
@@ -144,13 +177,12 @@ def load_pipeline():
                 if best_fix['goals']['away'] is not None:
                     base_record['away_goals_ft'] = int(best_fix['goals']['away'])
                     
-            # Enrichment: Fetch Possession, SOT, and Goal Events (Pro API capacity)
-            # Fetch if played AND (was in Understat recent list OR played in the last 7 days)
+            # Enrichment: Fetch Possession, SOT, and Goal Events
             is_recent = m.match_id in recent_played_ids or abs((datetime.utcnow().date() - m_date).days) <= 7
             
             if base_record['is_played'] and is_recent and api_football_key:
                 try:
-                    # 1. Fetch Basic Statistics (Possession/SOT)
+                    # 1. Fetch Basic Statistics
                     req = urllib.request.Request(
                         f"https://v3.football.api-sports.io/fixtures/statistics?fixture={base_record['apifootball_id']}", 
                         headers={'x-apisports-key': api_football_key}
@@ -158,44 +190,35 @@ def load_pipeline():
                     with urllib.request.urlopen(req) as resp:
                         stats_data = json.loads(resp.read().decode()).get('response', [])
                     if stats_data and len(stats_data) >= 2:
-                        h_stats = stats_data[0]['statistics']
-                        a_stats = stats_data[1]['statistics']
+                        h_stats, a_stats = stats_data[0]['statistics'], stats_data[1]['statistics']
                         def _get(a, k):
                             for s in a:
                                 if s['type'] == k and s['value'] is not None:
-                                    val = str(s['value']).replace('%', '') if s['value'] is not None else "0"
-                                    return int(val)
+                                    return int(str(s['value']).replace('%', ''))
                             return 0
                         base_record['home_possession'] = _get(h_stats, 'Ball Possession')
                         base_record['away_possession'] = _get(a_stats, 'Ball Possession')
                         base_record['home_sot'] = _get(h_stats, 'Shots on Goal')
                         base_record['away_sot'] = _get(a_stats, 'Shots on Goal')
-                        base_record['home_corners'] = _get(h_stats, 'Corner Kicks')
-                        base_record['away_corners'] = _get(a_stats, 'Corner Kicks')
-                        base_record['home_yellows'] = _get(h_stats, 'Yellow Cards')
-                        base_record['away_yellows'] = _get(a_stats, 'Yellow Cards')
-                        base_record['home_reds'] = _get(h_stats, 'Red Cards')
-                        base_record['away_reds'] = _get(a_stats, 'Red Cards')
                     
-                    # 2. Fetch Goal Events for Interval Analysis
+                    # 2. Fetch Goal Events
                     req_ev = urllib.request.Request(
                         f"https://v3.football.api-sports.io/fixtures/events?fixture={base_record['apifootball_id']}&type=goal", 
                         headers={'x-apisports-key': api_football_key}
                     )
                     with urllib.request.urlopen(req_ev) as resp:
                         ev_data = json.loads(resp.read().decode()).get('response', [])
-                    
-                    goals = []
-                    for ev in ev_data:
-                        if ev.get('type') == 'Goal':
-                            goals.append({
-                                'team': 'home' if ev['team']['id'] == best_fix['teams']['home']['id'] else 'away',
-                                'minute': ev['time']['elapsed'],
-                                'extra': ev['time']['extra']
-                            })
+                    goals = [{'team': 'home' if ev['team']['id'] == best_fix['teams']['home']['id'] else 'away', 'minute': ev['time']['elapsed']} for ev in ev_data if ev.get('type') == 'Goal']
                     base_record['goal_events'] = json.dumps(goals)
-                except Exception as e:
-                    print(f"Stats/Events enrichment failed for {m.home_team_name}: {e}")
+                    
+                    # 3. Fetch Lineups for Outlier tracking
+                    lineups = asyncio.run(api_client.get_fixture_lineups(base_record['apifootball_id']))
+                    if lineups:
+                        h_lineup = [p['player']['id'] for p in lineups[0]['startXI']]
+                        a_lineup = [p['player']['id'] for p in lineups[1]['startXI']]
+                        base_record['home_lineup'] = json.dumps(h_lineup)
+                        base_record['away_lineup'] = json.dumps(a_lineup)
+                except: pass
                 
         df_data.append(base_record)
     
@@ -206,9 +229,17 @@ def load_pipeline():
         windows=config.get('rolling_windows', [5, 10, 20]),
         max_rest_days=14
     )
-    features_df = fe.compute_features(matches_df)
-    feature_cols = [c for c in features_df.columns if c.startswith('delta_')]
-    features_df = features_df.dropna(subset=feature_cols)
+    # Perform compute_features with top_players and squad_churn (and empty dicts for new V2 features pending data ingestion layers)
+    features_df = fe.compute_features(matches_df, squad_churn=squad_churn, top_players=top_players, player_ratings={}, manager_changes={})
+    
+    # Feature Expansion: Deltas + Raw Elo + Outliers + Odds + Referees + V2 Context
+    feature_cols = [c for c in features_df.columns if c.startswith('delta_')] + [
+        'home_elo_pre', 'away_elo_pre', 'home_outliers', 'away_outliers',
+        'home_manager_bounce', 'away_manager_bounce', 'travel_distance',
+        'referee_cards_avg', 'feat_prob_home', 'feat_prob_draw', 'feat_prob_away'
+    ]
+    # Drop rows where critical rolling features are missing, but allow some slack for new features like outliers/odds
+    features_df = features_df.dropna(subset=[c for c in feature_cols if 'outliers' not in c and 'prob' not in c and 'ref' not in c and 'bounce' not in c and 'travel' not in c])
     
     train_df = features_df[features_df['is_played'] == True].copy()
     predict_df = features_df[features_df['is_played'] == False].copy()
@@ -217,7 +248,16 @@ def load_pipeline():
         return
         
     model = PoissonGoalsModel(alpha=1.0)
-    weights = np.ones(len(train_df))
+    
+    # phi(t) = exp(-xi * t) time-decay weighting
+    # We weight recent matches more heavily. xi = 0.005 (approx halving every 140 days)
+    now_ts = pd.Timestamp.utcnow().tz_localize(None)
+    days_ago = (now_ts - pd.to_datetime(train_df['date_utc']).dt.tz_localize(None)).dt.days
+    
+    # Clip negative days to 0 just in case
+    days_ago = days_ago.clip(lower=0)
+    weights = np.exp(-0.005 * days_ago).values
+    
     model.fit(train_df, team_cols=[], covariate_cols=feature_cols, weights=weights)
     
     # --- 5. Init and Train XGBoost Classifier ---
@@ -248,7 +288,8 @@ def load_pipeline():
                 'prob_d': row['class_prob_d'],
                 'prob_a': row['class_prob_a']
             }
-            mkt = deriver.derive_markets(row['lambda_h'], row['lambda_a'], classifier_probs=c_probs)
+            # Using weight_poisson=0.90 to maximize Strike Rate (Accuracy)
+            mkt = deriver.derive_markets(row['lambda_h'], row['lambda_a'], classifier_probs=c_probs, weight_poisson=0.90)
             
             # Fetch Bookmaker Odds for EV comparison
             fixture_odds = {}
@@ -305,6 +346,9 @@ def load_pipeline():
             a_elo = row.get('away_elo_pre', 1500)
             elo_insights = deriver.derive_elo_insights(h_elo, a_elo, row['lambda_h'], row['lambda_a'])
             
+            # Match Tier (Type 1-3) based on Kelly Index
+            match_tier = deriver.classify_match_tier(recs)
+            
             # History for interval stats (Pro Plan data available in features_df)
             h_hist = train_df[train_df['home_team_name'] == row['home_team_name']]
             a_hist = train_df[train_df['away_team_name'] == row['away_team_name']]
@@ -325,6 +369,7 @@ def load_pipeline():
                 "home_elo": round(h_elo),
                 "away_elo": round(a_elo),
                 "elo_insights": elo_insights,
+                "kelly_tier": match_tier,
                 "markets": recs,
                 "goal_intervals": intervals
             })

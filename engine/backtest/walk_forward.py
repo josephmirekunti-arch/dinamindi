@@ -83,6 +83,18 @@ class WalkForwardEvaluator:
         y_pred_1x2 = results[['P_H', 'P_D', 'P_A']].values
         ll_1x2 = log_loss(y_true_1x2, y_pred_1x2)
         
+        # Ranked Probability Score (RPS) for 1X2
+        # Ordinal outcome order: Home Win (0), Draw (1), Away Win (2)
+        y_ord = results['actual_1x2'].map({'H': 0, 'D': 1, 'A': 2}).values
+        P1 = results['P_H'].values
+        P2 = results['P_H'].values + results['P_D'].values
+        
+        Y1 = (y_ord == 0).astype(int)
+        Y2 = (y_ord <= 1).astype(int)
+        
+        # RPS Formula: 1/(r-1) * sum((P_i - Y_i)^2) where r=3
+        rps_1x2 = 0.5 * np.mean((P1 - Y1)**2 + (P2 - Y2)**2)
+        
         # Brier score for O2.5
         brier_o25 = brier_score_loss(results['actual_o25'], results['P_O25'])
         
@@ -91,6 +103,7 @@ class WalkForwardEvaluator:
         
         return {
             'log_loss_1x2': ll_1x2,
+            'rps_1x2': rps_1x2,
             'brier_o25': brier_o25,
             'brier_btts': brier_btts
         }, results

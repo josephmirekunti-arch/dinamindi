@@ -2,16 +2,42 @@ import numpy as np
 from scipy.stats import poisson
 
 class ProbabilityDeriver:
-    def __init__(self, max_goals=8):
+    def __init__(self, max_goals=8, rho=-0.15):
         self.max_goals = max_goals
+        self.rho = rho # Dixon-Coles correlation coefficient
         
     def _goals_matrix(self, lambda_h, lambda_a):
         """
         Computes the max_goals x max_goals matrix of probabilities P(h=i, a=j).
+        Applies Dixon-Coles adjustment for low scores.
         """
         h_prob = [poisson.pmf(i, lambda_h) for i in range(self.max_goals + 1)]
         a_prob = [poisson.pmf(j, lambda_a) for j in range(self.max_goals + 1)]
-        return np.outer(h_prob, a_prob)
+        mat = np.outer(h_prob, a_prob)
+        
+        # Dixon-Coles tau(x, y) adjustment logic
+        # rho < 0 (typical) increases P(0,0) and P(1,1) but decreases P(1,0) and P(0,1)
+        # Actually standard Dixon-Coles:
+        # P(0,0) = p0_h * p0_a * (1 - lambda_h * lambda_a * rho)
+        # P(1,0) = p1_h * p0_a * (1 + lambda_a * rho)
+        # P(0,1) = p0_h * p1_a * (1 + lambda_h * rho)
+        # P(1,1) = p1_h * p1_a * (1 - rho)
+        
+        if lambda_h > 0 and lambda_a > 0:
+            adj00 = 1 - (lambda_h * lambda_a * self.rho)
+            adj10 = 1 + (lambda_a * self.rho)
+            adj01 = 1 + (lambda_h * self.rho)
+            adj11 = 1 - self.rho
+            
+            mat[0, 0] *= max(0, adj00)
+            mat[1, 0] *= max(0, adj10)
+            mat[0, 1] *= max(0, adj01)
+            mat[1, 1] *= max(0, adj11)
+            
+            # Re-normalize to ensure sum is 1.0 after adjustment
+            mat /= np.sum(mat)
+            
+        return mat
         
     def derive_markets(self, lambda_h: float, lambda_a: float, classifier_probs: dict = None, weight_poisson=0.5) -> dict:
         """
@@ -198,13 +224,17 @@ class ProbabilityDeriver:
             implied_prob = None
             ev_status = "Unknown"
             ev_margin = 0.0
+            kelly_index = 0.0
             
-            if bookie_odd and bookie_odd > 0:
+            if bookie_odd and bookie_odd > 1.0:
                 implied_prob = 1.0 / bookie_odd
                 # Expected Value = (Probability of Winning * Win Payout) - Probability of Losing * 1
-                # Simplified: (Prob * Decimal Odd) - 1
                 calc_ev = (prob * bookie_odd) - 1.0
                 ev_margin = calc_ev
+                
+                # Kelly Criterion Fraction
+                b = bookie_odd - 1.0
+                kelly_index = (prob * bookie_odd - 1.0) / b if b > 0 else 0.0
                 
                 if calc_ev > 0.05: # >5% edge
                     ev_status = "High Value (+EV)"
@@ -221,7 +251,8 @@ class ProbabilityDeriver:
                 "bookie_odd": bookie_odd,
                 "implied_prob": float(implied_prob) if implied_prob else None,
                 "ev_status": ev_status,
-                "ev_margin": float(ev_margin)
+                "ev_margin": float(ev_margin),
+                "kelly_index": float(kelly_index)
             }
             
         # Add core markets to display
@@ -302,6 +333,26 @@ class ProbabilityDeriver:
             insight["recommended_markets"] = ["DNB Away", "Double Chance X2"]
             
         return insight
+
+    def classify_match_tier(self, ev_markets: list[dict]) -> str:
+        """
+        Classifies the match into difficulty tiers (Type 1, Type 2, Type 3)
+        based on the maximum Kelly Index identified within the match markets.
+        Type 1: High confidence value bet (Max Kelly > 0.05)
+        Type 2: Moderate confidence / Even match (0 < Max Kelly <= 0.05)
+        Type 3: Low confidence / No edge (Max Kelly <= 0)
+        """
+        max_kelly = 0.0
+        for m in ev_markets:
+            if m.get("kelly_index", 0.0) > max_kelly:
+                max_kelly = m["kelly_index"]
+                
+        if max_kelly > 0.05:
+            return "Type 1"
+        elif max_kelly > 0.0:
+            return "Type 2"
+        else:
+            return "Type 3"
 
     def derive_secondary_markets(self, lam_corners: float, lam_cards: float, threshold: float = 0.55) -> list[dict]:
         """
