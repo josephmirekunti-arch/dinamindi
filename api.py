@@ -18,6 +18,7 @@ from engine.ingest.understat import UnderstatIngestor
 from engine.validate.schema import MatchValidator
 from engine.features.rolling import FeatureEngineer
 from engine.model.poisson import PoissonGoalsModel
+from engine.model.classifier import MatchClassifier
 from engine.predict.probs import ProbabilityDeriver
 
 app = FastAPI(title="Dinamindi - Football Probability Engine")
@@ -219,6 +220,10 @@ def load_pipeline():
     weights = np.ones(len(train_df))
     model.fit(train_df, team_cols=[], covariate_cols=feature_cols, weights=weights)
     
+    # --- 5. Init and Train XGBoost Classifier ---
+    classifier = MatchClassifier()
+    classifier.fit(train_df, feature_cols)
+    
     deriver = ProbabilityDeriver(max_goals=config.get('max_goals', 8))
     thresholds = config.get('selection_thresholds', {})
     
@@ -226,12 +231,24 @@ def load_pipeline():
     predict_data = []
     if len(predict_df) > 0:
         preds = model.predict_lambdas(predict_df, feature_cols)
+        class_probs = classifier.predict_probs(predict_df, feature_cols)
+        
         predict_df['lambda_h'] = preds['lambda_h'].values
         predict_df['lambda_a'] = preds['lambda_a'].values
+        
+        # Store classifier probs in df for the loop
+        predict_df['class_prob_h'] = class_probs['prob_h'].values
+        predict_df['class_prob_d'] = class_probs['prob_d'].values
+        predict_df['class_prob_a'] = class_probs['prob_a'].values
         predict_df = predict_df.sort_values(by='date_utc')
         
         for idx, row in predict_df.head(15).iterrows():
-            mkt = deriver.derive_markets(row['lambda_h'], row['lambda_a'])
+            c_probs = {
+                'prob_h': row['class_prob_h'],
+                'prob_d': row['class_prob_d'],
+                'prob_a': row['class_prob_a']
+            }
+            mkt = deriver.derive_markets(row['lambda_h'], row['lambda_a'], classifier_probs=c_probs)
             
             # Fetch Bookmaker Odds for EV comparison
             fixture_odds = {}

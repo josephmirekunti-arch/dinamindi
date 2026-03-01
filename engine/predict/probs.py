@@ -13,16 +13,34 @@ class ProbabilityDeriver:
         a_prob = [poisson.pmf(j, lambda_a) for j in range(self.max_goals + 1)]
         return np.outer(h_prob, a_prob)
         
-    def derive_markets(self, lambda_h: float, lambda_a: float) -> dict:
+    def derive_markets(self, lambda_h: float, lambda_a: float, classifier_probs: dict = None, weight_poisson=0.5) -> dict:
         """
         Derives P(H), P(D), P(A), O/U 0.5, 1.5, 2.5, BTTS, DNB, and AH.
+        If classifier_probs is provided, 1X2 outcomes are blended.
         """
         mat = self._goals_matrix(lambda_h, lambda_a)
         
-        p_h = np.sum(np.tril(mat, -1))
-        p_d = np.sum(np.diag(mat))
-        p_a = np.sum(np.triu(mat, 1))
+        # Poisson-derived 1X2
+        p_h_poi = np.sum(np.tril(mat, -1))
+        p_d_poi = np.sum(np.diag(mat))
+        p_a_poi = np.sum(np.triu(mat, 1))
         
+        # Ensemble blending for 1X2
+        if classifier_probs:
+            # weight_poisson=0.5 means equal voting as per simple ensemble best practices
+            weight_ml = 1.0 - weight_poisson
+            p_h = (p_h_poi * weight_poisson) + (classifier_probs['prob_h'] * weight_ml)
+            p_d = (p_d_poi * weight_poisson) + (classifier_probs['prob_d'] * weight_ml)
+            p_a = (p_a_poi * weight_poisson) + (classifier_probs['prob_a'] * weight_ml)
+            
+            # Re-normalize to ensure sum is exactly 1.0
+            total = p_h + p_d + p_a
+            p_h /= total
+            p_d /= total
+            p_a /= total
+        else:
+            p_h, p_d, p_a = p_h_poi, p_d_poi, p_a_poi
+
         # Over/Under 0.5, 1.5, 2.5
         p_u05 = mat[0, 0]
         p_o05 = 1.0 - p_u05
