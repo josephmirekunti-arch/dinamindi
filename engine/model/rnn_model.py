@@ -64,6 +64,10 @@ class GRUClassifierWrapper:
                 if h_col in X.columns: X_home_seq[:, s_idx, f_idx] = X[h_col].values
                 if a_col in X.columns: X_away_seq[:, s_idx, f_idx] = X[a_col].values
 
+        # Possession/SOT are only enriched for recent matches; a single NaN would poison the GRU weights
+        X_home_seq = np.nan_to_num(X_home_seq, nan=0.0)
+        X_away_seq = np.nan_to_num(X_away_seq, nan=0.0)
+
         return X_home_seq, X_away_seq
 
     def fit(self, X, y):

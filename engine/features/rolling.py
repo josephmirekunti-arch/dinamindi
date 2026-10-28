@@ -90,6 +90,14 @@ class FeatureEngineer:
         
         # 1. Compute Elo with Roster Volatility
         matches_df = self._compute_elo(matches_df, squad_churn)
+
+        # API-Football enrichment columns are optional (absent without an API key or on Understat-only runs)
+        optional_cols = ['home_possession', 'away_possession', 'home_sot', 'away_sot',
+                         'home_corners', 'away_corners', 'referee',
+                         'odds_1x2_home', 'odds_1x2_draw', 'odds_1x2_away']
+        for col in optional_cols:
+            if col not in matches_df.columns:
+                matches_df[col] = np.nan
         
         # 2. Player Outlier Tracking & Starting XI Ratings
         def process_lineup(row, team_prefix='home'):

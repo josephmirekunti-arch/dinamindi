@@ -1,4 +1,5 @@
 import yaml
+import numpy as np
 import pandas as pd
 from engine.store.db import DbStore, Match
 from engine.ingest.understat import UnderstatIngestor
@@ -129,5 +130,4 @@ def main():
         print("-" * 50)
 
 if __name__ == "__main__":
-    import numpy as np
     main()
