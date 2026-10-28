@@ -26,3 +26,6 @@ football_engine.db
 .idea/
 .DS_Store
 Thumbs.db
+
+# ML training artifacts
+catboost_info/

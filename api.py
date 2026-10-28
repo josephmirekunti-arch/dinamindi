@@ -46,10 +46,32 @@ import threading
 pipeline_lock = threading.Lock()
 
 def load_pipeline():
+    # Hold the lock for the whole build so concurrent first requests wait instead of each running the pipeline
     with pipeline_lock:
         if app.state.is_loaded:
             return
         print("Loading pipeline...")
+        _build_pipeline()
+
+def _fit_models(train_df: pd.DataFrame, feature_cols: list[str]):
+    model = PoissonGoalsModel(alpha=1.0)
+
+    # phi(t) = exp(-xi * t) time-decay weighting
+    # We weight recent matches more heavily. xi = 0.005 (approx halving every 140 days)
+    now_ts = pd.Timestamp.utcnow().tz_localize(None)
+    days_ago = (now_ts - pd.to_datetime(train_df['date_utc']).dt.tz_localize(None)).dt.days
+
+    # Clip negative days to 0 just in case
+    days_ago = days_ago.clip(lower=0)
+    weights = np.exp(-0.005 * days_ago).values
+
+    model.fit(train_df, team_cols=[], covariate_cols=feature_cols, weights=weights)
+
+    classifier = MatchClassifier()
+    classifier.fit(train_df, feature_cols)
+    return model, classifier
+
+def _build_pipeline():
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
         
@@ -247,23 +269,9 @@ def load_pipeline():
     if len(train_df) < 20:
         return
         
-    model = PoissonGoalsModel(alpha=1.0)
-    
-    # phi(t) = exp(-xi * t) time-decay weighting
-    # We weight recent matches more heavily. xi = 0.005 (approx halving every 140 days)
-    now_ts = pd.Timestamp.utcnow().tz_localize(None)
-    days_ago = (now_ts - pd.to_datetime(train_df['date_utc']).dt.tz_localize(None)).dt.days
-    
-    # Clip negative days to 0 just in case
-    days_ago = days_ago.clip(lower=0)
-    weights = np.exp(-0.005 * days_ago).values
-    
-    model.fit(train_df, team_cols=[], covariate_cols=feature_cols, weights=weights)
-    
-    # --- 5. Init and Train XGBoost Classifier ---
-    classifier = MatchClassifier()
-    classifier.fit(train_df, feature_cols)
-    
+    # --- 4. Train Poisson + Ensemble Classifier on all played matches ---
+    model, classifier = _fit_models(train_df, feature_cols)
+
     deriver = ProbabilityDeriver(max_goals=config.get('max_goals', 8))
     thresholds = config.get('selection_thresholds', {})
     
@@ -358,6 +366,7 @@ def load_pipeline():
             a_logo = row.get('away_logo')
             
             predict_data.append({
+                "apifootball_id": int(row['apifootball_id']) if pd.notnull(row.get('apifootball_id')) else None,
                 "date": row['date_utc'].isoformat(),
                 "competition": row['competition'],
                 "home_team": row['home_team_name'],
@@ -375,17 +384,31 @@ def load_pipeline():
             })
             
     # Process Performance (Past)
-    # We will score the last 20 played matches to see how the model performed
+    # Score the last 20 played matches out-of-sample: separate models are fit only on matches
+    # before the holdout, and scored with the same Poisson/ensemble blend used for predictions.
     performance_data = []
-    recent_train = train_df.sort_values(by='date_utc', ascending=False).head(20)
-    
-    if len(recent_train) > 0:
-        perf_preds = model.predict_lambdas(recent_train, feature_cols)
+    holdout_size = 20
+    played_sorted = train_df.sort_values(by='date_utc')
+    fit_df = played_sorted.iloc[:-holdout_size]
+    recent_train = played_sorted.iloc[-holdout_size:].sort_values(by='date_utc', ascending=False).copy()
+
+    if len(fit_df) >= 20 and len(recent_train) > 0:
+        eval_model, eval_classifier = _fit_models(fit_df, feature_cols)
+        perf_preds = eval_model.predict_lambdas(recent_train, feature_cols)
+        perf_class_probs = eval_classifier.predict_probs(recent_train, feature_cols)
         recent_train['lambda_h'] = perf_preds['lambda_h'].values
         recent_train['lambda_a'] = perf_preds['lambda_a'].values
-        
+        recent_train['class_prob_h'] = perf_class_probs['prob_h'].values
+        recent_train['class_prob_d'] = perf_class_probs['prob_d'].values
+        recent_train['class_prob_a'] = perf_class_probs['prob_a'].values
+
         for idx, row in recent_train.iterrows():
-            mkt = deriver.derive_markets(row['lambda_h'], row['lambda_a'])
+            c_probs = {
+                'prob_h': row['class_prob_h'],
+                'prob_d': row['class_prob_d'],
+                'prob_a': row['class_prob_a']
+            }
+            mkt = deriver.derive_markets(row['lambda_h'], row['lambda_a'], classifier_probs=c_probs, weight_poisson=0.90)
             
             # Determine actual results
             hg = row['home_goals_ft']
